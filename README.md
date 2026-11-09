@@ -2,6 +2,8 @@
 
 Windows 心电工作站。支持 WFDB `.hea` 记录导入、12 导联心电纸显示、心搏分类与波形参数测量。
 
+![ECG Workstation 12+1 导联界面演示](docs/ecg-workstation-demo.png)
+
 1. 从 GitHub Releases 下载 Windows x64 ZIP，完整解压到本地目录。
 2. 双击 `ECGWorkstation.exe`，点击「新患者」选择 `.hea`。请把 `.hea` 和头文件引用的波形文件放在一起。
 3. 默认显示 12+1 布局和 10 秒窗口，可切换布局、走速、增益和起始时间。
