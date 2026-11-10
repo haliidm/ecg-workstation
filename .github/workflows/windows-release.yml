@@ -1,0 +1,73 @@
+name: Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag (vX.Y.Z)
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install Windows build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -r requirements-windows.txt pyinstaller==6.22.3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build Windows executable
+        shell: pwsh
+        run: ./build-windows.ps1
+      - name: Archive and publish
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw 'Invalid release tag' }
+          $zip = "ECGWorkstation-$tag-windows-x64.zip"
+          @"
+          from hashlib import file_digest
+          from pathlib import Path
+          from zipfile import ZipFile, ZIP_DEFLATED
+          from importlib import metadata
+          import shutil
+          dist = Path('dist')
+          root = dist / 'ECGWorkstation'
+          asset = Path('$zip')
+          shutil.copytree('docs', root / 'docs', dirs_exist_ok=True)
+          for distribution in metadata.distributions():
+              for file in distribution.files or ():
+                  if '.dist-info' not in str(file) or not any(word in file.name.lower() for word in ('license', 'copying', 'notice')):
+                      continue
+                  source = distribution.locate_file(file)
+                  if source.is_file():
+                      target = root / 'licenses' / distribution.metadata['Name'] / file.name
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(source, target)
+          with ZipFile(asset, 'w', compression=ZIP_DEFLATED) as archive:
+              for file in sorted(root.rglob('*')):
+                  if file.is_file() and file.suffix.lower() not in {'.hea', '.dat', '.pth', '.pyc'}:
+                      archive.write(file, file.relative_to(dist).as_posix())
+          with ZipFile(asset) as archive:
+              assert archive.testzip() is None
+              assert 'ECGWorkstation/ECGWorkstation.exe' in archive.namelist()
+          with asset.open('rb') as handle:
+              digest = file_digest(handle, 'sha256').hexdigest()
+          Path(str(asset) + '.sha256').write_text(f'{digest}  {asset.name}\n', encoding='ascii')
+          "@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release upload $tag $zip "$zip.sha256" --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
