@@ -6,7 +6,7 @@ Windows 心电工作站。支持 WFDB `.hea` 记录导入、12 导联心电纸�
 
 1. 从 GitHub Releases 下载 Windows x64 ZIP，完整解压到本地目录。
 2. 双击 `ECGWorkstation.exe`，点击「新患者」选择 `.hea`。请把 `.hea` 和头文件引用的波形文件放在一起。
-3. 默认显示 12+1 布局和 10 秒窗口，可切换布局、走速、增益和起始时间。
+3. 默认显示 12+1 布局和 10 秒窗口。拖动「时间窗口」滑条浏览整段记录，也可切换布局、走速和增益。
 4. N/S/V/F/Q 心搏分类所用的 CPU 模型已随包提供。若要启用 ECGFounder，需从[模型官方页面](https://huggingface.co/PKUDigitalHealth/ECGFounder/tree/main)下载 `12_lead_ECGFounder.pth`，再通过「模型权重」选择该文件。
 
 用于算法研究和结果复核。模型输出和自动测量未经本工作站的临床验证。

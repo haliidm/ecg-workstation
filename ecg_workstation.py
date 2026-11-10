@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).parent / '.runtime_deps'))
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import concurrent.futures
+from bisect import bisect_left
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -27,13 +28,16 @@ def read_record(path):
     return rec
 
 
-def signal_in_mv(record, channel):
-    signal = np.array(record.p_signal[:, channel], dtype=float, copy=True)
-    unit = record.units[channel].strip().casefold()
+def mv_factor(unit_name):
+    unit = unit_name.strip().casefold()
     factors = {'mv': 1, 'uv': 0.001, 'μv': 0.001, 'v': 1000}
     if unit not in factors:
-        raise ValueError('不支持的幅值单位：' + record.units[channel])
-    return signal * factors[unit]
+        raise ValueError('不支持的幅值单位：' + unit_name)
+    return factors[unit]
+
+
+def signal_in_mv(record, channel):
+    return np.asarray(record.p_signal[:, channel], dtype=float) * mv_factor(record.units[channel])
 
 
 def classify_record_beats(record, classifier):
@@ -137,10 +141,22 @@ class Workstation(tk.Tk):
         for label,var,values in [('布局（行×列）',self.layout,['4X3','3X4','6X2','12+1']),('走速 mm/s',self.speed,['12.5','25','50']),('增益 mm/mV',self.gain,['5','10','20']),('参数导联',self.lead,LEADS)]:
             ttk.Label(controls,text=label).pack(side='left',padx=6)
             box = ttk.Combobox(controls,textvariable=var,values=values,width=10,state='readonly'); box.pack(side='left'); box.bind('<<ComboboxSelected>>',lambda e:self.refresh())
-        ttk.Label(controls,text='起始时间（秒）').pack(side='left',padx=8)
-        self.start = tk.DoubleVar(value=0)
-        ttk.Spinbox(controls,from_=0,to=86400,increment=1,textvariable=self.start,width=8,command=self.draw).pack(side='left')
-        ttk.Button(controls,text='刷新',command=self.draw).pack(side='left',padx=5)
+        timeline = ttk.Frame(self, padding=(16, 0, 16, 8))
+        timeline.pack(fill='x')
+        ttk.Label(timeline, text='时间窗口').pack(side='left', padx=(0, 10))
+        self.window_position = tk.DoubleVar(value=0)
+        self.window_range = tk.StringVar(value='导入记录后可拖动')
+        self.window_job = None
+        self.waveform_lines = []
+        self.marker_axes = []
+        self.beat_markers = []
+        self.window_slider = ttk.Scale(timeline, from_=0, to=1, variable=self.window_position,
+                                       command=self.slide_window, state='disabled')
+        self.window_slider.pack(side='left', fill='x', expand=True)
+        self.window_slider.bind('<ButtonRelease-1>', self.finish_window_slide)
+        self.window_slider.bind('<Left>', lambda event: self.step_window(-1))
+        self.window_slider.bind('<Right>', lambda event: self.step_window(1))
+        ttk.Label(timeline, textvariable=self.window_range, width=35, anchor='e').pack(side='right')
         self.beat_status = tk.StringVar(value='心搏分类 · 等待分析')
         beat_bar = ttk.Frame(self, padding=(12, 0, 12, 5))
         beat_bar.pack(fill='x')
@@ -192,7 +208,8 @@ class Workstation(tk.Tk):
         if not path:return
         self.status.set('正在读取心电数据…')
         def done(rec):
-            self.record=rec; self.results={}; self.axes={}; self.beats=[]; self.start.set(0)
+            self.record=rec; self.results={}; self.axes={}; self.beats=[]
+            self.reset_window_slider()
             self.paper_view.yview_moveto(0)
             self.patient.set(f'{rec.record_name}  |  {rec.n_sig} 导联  |  {rec.fs:g} Hz  |  {rec.sig_len/rec.fs:.1f} 秒')
             self.refresh(); self.start_analysis()
@@ -265,8 +282,61 @@ class Workstation(tk.Tk):
         self.paper_view.configure(scrollregion=(0, 0, width, height))
         self.fig.set_size_inches(width / self.fig.dpi, height / self.fig.dpi, forward=False)
 
+    def reset_window_slider(self):
+        self.window_position.set(0)
+        last_sample = self.last_window_sample()
+        self.window_slider.configure(to=max(1, last_sample), state='normal' if last_sample else 'disabled')
+
+    def last_window_sample(self):
+        return max(0, self.record.sig_len - round(DISPLAY_SECONDS * self.record.fs)) if self.record else 0
+
+    def slide_window(self, _value):
+        if self.window_job is None:
+            self.window_job = self.after(45, self.finish_window_slide)
+
+    def step_window(self, direction):
+        if self.last_window_sample():
+            sample = self.window_position.get() + direction * self.record.fs
+            self.window_position.set(max(0, min(sample, self.last_window_sample())))
+            self.finish_window_slide()
+        return 'break'
+
+    def finish_window_slide(self, _event=None):
+        if self.window_job is not None:
+            self.after_cancel(self.window_job)
+            self.window_job = None
+        self.update_waveforms()
+
+    def update_waveforms(self):
+        if self.record is None:
+            return
+        fs = self.record.fs
+        first = max(0, min(round(self.window_position.get()), self.last_window_sample()))
+        last = min(self.record.sig_len, first + round(DISPLAY_SECONDS * fs))
+        seconds = np.arange(last - first) / fs
+        for line, channel, factor in self.waveform_lines:
+            line.set_data(seconds, self.record.p_signal[first:last, channel] * factor)
+
+        for marker in self.beat_markers:
+            marker.remove()
+        self.beat_markers.clear()
+        left = bisect_left(self.beats, first, key=lambda beat: beat[0])
+        right = bisect_left(self.beats, last, lo=left, key=lambda beat: beat[0])
+        for ax in self.marker_axes:
+            for peak, label in self.beats[left:right]:
+                symbol = '·' if label == 'UNKNOWN' else label
+                marker = ax.text((peak - first) / fs, 1.02, symbol,
+                                 transform=ax.get_xaxis_transform(), ha='center', va='bottom',
+                                 fontsize=9, fontweight='bold', color=BEAT_COLORS[label])
+                self.beat_markers.append(marker)
+        self.window_range.set(f'{first / fs:.2f}–{last / fs:.2f} 秒 / {self.record.sig_len / fs:.2f} 秒')
+        self.canvas.draw_idle()
+
     def draw(self):
         self.fig.clear()
+        self.waveform_lines.clear()
+        self.marker_axes.clear()
+        self.beat_markers.clear()
         width = self.paper_view.winfo_width()
         viewport_height = self.paper_view.winfo_height()
         if width < 120 or viewport_height < 60:
@@ -275,8 +345,6 @@ class Workstation(tk.Tk):
             self.size_paper(width, viewport_height)
             ax=self.fig.add_subplot(); ax.axis('off'); ax.text(.5,.55,'ECG WORKSTATION',ha='center',fontsize=26,color='#235e85'); ax.text(.5,.43,'Import a WFDB .hea record to begin',ha='center',fontsize=13); self.canvas.draw_idle(); return
         rows,cols=(13,1) if self.layout.get()=='12+1' else tuple(map(int,self.layout.get().split('X')))
-        try:start=max(0,min(float(self.start.get()),max(0,self.record.sig_len/self.record.fs-DISPLAY_SECONDS)))
-        except Exception:return
         speed,gain=float(self.speed.get()),float(self.gain.get())
         # Fit a fixed time span in each column and use its scale vertically too.
         top_margin, bottom_margin, side_margin = 28, 25, 10
@@ -292,9 +360,6 @@ class Workstation(tk.Tk):
         amplitude_limit = row_mm / (2 * gain)
         names=LEADS+(['II'] if rows==13 else [])
         record_leads = [canonical_lead(name) for name in self.record.sig_name]
-        a = int(start * self.record.fs)
-        z = min(self.record.sig_len, a + int(np.ceil(duration * self.record.fs)))
-        visible_beats = [(peak, label) for peak, label in self.beats if a <= peak < z]
         for index,name in enumerate(names):
             row, col = divmod(index, cols)
             ax = self.fig.add_axes(((paper_left + col * panel_px) / width,
@@ -312,23 +377,21 @@ class Workstation(tk.Tk):
                     va='top',fontsize=9,color='#263c48',fontweight='bold',
                     bbox={'facecolor':'#fffafa','edgecolor':'none','pad':1.5})
             if name in record_leads:
-                channel=record_leads.index(name)
-                y=self.record.p_signal[a:z,channel].copy(); unit=self.record.units[channel].lower()
-                if unit in ('uv','µv'):y/=1000
-                elif unit=='v':y*=1000
-                if unit in ('mv','uv','µv','v'):ax.plot(np.arange(len(y))/self.record.fs,y,color='#263c48',linewidth=.65)
-                else:ax.text(.4,.5,'Unsupported units',transform=ax.transAxes)
+                channel = record_leads.index(name)
+                try:
+                    factor = mv_factor(self.record.units[channel])
+                except ValueError:
+                    ax.text(.4,.5,'Unsupported units',transform=ax.transAxes)
+                else:
+                    line, = ax.plot([], [], color='#263c48', linewidth=.65)
+                    self.waveform_lines.append((line, channel, factor))
             else:ax.text(.4,.5,'Lead unavailable',transform=ax.transAxes,color='gray')
             if index < cols:
-                for peak, label in visible_beats:
-                    symbol = '·' if label == 'UNKNOWN' else label
-                    ax.text((peak - a) / self.record.fs, 1.02, symbol,
-                            transform=ax.get_xaxis_transform(), ha='center', va='bottom',
-                            fontsize=9, fontweight='bold', color=BEAT_COLORS[label])
+                self.marker_axes.append(ax)
             for spine in ax.spines.values():spine.set_visible(False)
         footer_y = (paper_height - top_margin - rows * row_px - 8) / paper_height
         self.fig.text(paper_left / width, footer_y, f'{speed:g} mm/s   |   {gain:g} mm/mV',
                       va='top', fontsize=9, color='#56656e')
-        self.canvas.draw_idle()
+        self.update_waveforms()
 
 if __name__=='__main__': Workstation().mainloop()
